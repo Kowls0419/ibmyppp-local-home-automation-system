@@ -1,0 +1,146 @@
+esphome:
+  name: kyles-esp32-a
+  friendly_name: kyles-esp32-a
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+api:
+  encryption:
+    key: !secret api_key_a
+
+ota:
+  - platform: esphome
+    password: !secret ota_password_a
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Kyles-Esp32-A Fallback Hotspot"
+    password: !secret fallback_ap_password_a
+
+captive_portal:
+
+output:
+  - platform: ledc
+    pin: GPIO18
+    id: pwm_top
+    frequency: 50Hz
+  - platform: ledc
+    pin: GPIO19
+    id: pwm_bottom
+    frequency: 50Hz
+
+  - platform: template
+    id: dummy_out_top
+    type: binary
+    write_action:
+      - lambda: |-
+  - platform: template
+    id: dummy_out_bottom
+    type: binary
+    write_action:
+      - lambda: |-
+
+servo:
+  - id: servo_top
+    output: pwm_top
+    auto_detach_time: 2.5s
+    restore: true
+  - id: servo_bottom
+    output: pwm_bottom
+    auto_detach_time: 2.5s
+    restore: true
+
+globals:
+  - id: press_dist
+    type: float
+    initial_value: '0.27'
+    restore_value: yes
+
+number:
+  - platform: template
+    name: "Servo Depth"
+    id: top_depth_slider
+    optimistic: true
+    min_value: 0.15
+    max_value: 0.40
+    step: 0.01
+    initial_value: 0.27
+    restore_value: true
+    unit_of_measurement: "dist"
+    mode: slider
+    on_value:
+      then:
+        - globals.set: {id: press_dist, value: !lambda "return x;"}
+
+script:
+  - id: top_servo_sequence
+    mode: queued
+    parameters:
+      target_level: float
+    then:
+      - servo.write: 
+          id: servo_top
+          level: !lambda "return target_level;"
+      - delay: 850ms
+      - servo.write: 
+          id: servo_top
+          level: 0.0
+      - delay: 1000ms
+
+  - id: bottom_servo_sequence
+    mode: queued
+    parameters:
+      target_level: float
+    then:
+      - servo.write: 
+          id: servo_bottom
+          level: !lambda "return target_level;"
+      - delay: 700ms
+      - servo.write: 
+          id: servo_bottom
+          level: 0.0
+      - delay: 800ms
+
+light:
+  - platform: binary
+    name: "Ceiling Lights"
+    id: light_top
+    output: dummy_out_top
+    on_turn_on:
+      - script.execute: 
+          id: top_servo_sequence
+          target_level: !lambda "return -1.0 * id(press_dist);"
+    on_turn_off:
+      - script.execute: 
+          id: top_servo_sequence
+          target_level: !lambda "return id(press_dist);"
+
+  - platform: binary
+    name: "Desk Lights"
+    id: light_bottom
+    output: dummy_out_bottom
+    on_turn_on:
+      - script.execute: 
+          id: bottom_servo_sequence
+          target_level: !lambda "return id(press_dist);"
+    on_turn_off:
+      - script.execute: 
+          id: bottom_servo_sequence
+          target_level: !lambda "return -1.0 * id(press_dist);"
+
+button:
+  - platform: template
+    name: "STOP & EMERGENCY RESET"
+    icon: "mdi:alert-octagon"
+    on_press:
+      - script.stop: top_servo_sequence
+      - script.stop: bottom_servo_sequence
+      - servo.write: { id: servo_top, level: 0.0 }
+      - servo.write: { id: servo_bottom, level: 0.0 }
+      - logger.log: "EMERGENCY RESET: All sequences cleared"

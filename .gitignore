@@ -1,0 +1,9 @@
+# ESPHome
+secrets.yaml
+.esphome/
+/.pioenvs/
+/.piolibdeps/
+*.bak*
+
+# macOS
+.DS_Store
