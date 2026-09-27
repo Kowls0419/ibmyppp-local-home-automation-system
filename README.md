@@ -13,8 +13,6 @@ This started as my **IB MYP Personal Project** (Grade 10), which was finished in
 
 ▶️ **1-minute demo:** https://youtu.be/X8RdsDESKhM
 
-![Light switch actuator mounted on the wall switch](docs/images/actuator-mounted.jpg)
-
 ---
 
 ## Why
