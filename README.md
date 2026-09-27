@@ -1,4 +1,6 @@
-# ESPHome Smart Room
+# Local Home Automation System
+
+![Local Home Automation System: Utilizing Microcontrollers to Construct Custom Home Assistant Integrated Devices](docs/images/title-banner.jpg)
 
 Two DIY ESP32 devices that make an ordinary bedroom light switch smart without rewiring it:
 
@@ -35,6 +37,10 @@ The product goal was two custom IoT devices that integrate into Home Assistant a
 2. **Automation.** Home Assistant runs **Enter Room** when the count rises above 0 and **Exit room** when it drops below 1.
 3. **Servo actuate.** HA turns board A's `light` entities on or off, and board A presses the matching switch.
 4. **State sync.** HA's HomeKit Bridge exposes the lights to Apple Home and Siri, and the Home Assistant app works remotely over Tailscale.
+
+| Home Assistant app | Siri / HomeKit (Apple Watch) |
+|---|---|
+| ![Toggling the lights from the Home Assistant app](docs/images/control-ha-app.jpg) | ![Toggling the lights with Siri on an Apple Watch](docs/images/control-siri-watch.jpg) |
 
 ### Homelab it runs on
 
@@ -85,6 +91,10 @@ Total cost was about **US$25**, within the project's US$30 budget.
 | 2 | Onboard blue LED (status) |
 
 ![People counter circuit](docs/images/circuit-people-counter.png)
+
+The emitters and receivers are taped along the door frame, with the wiring routed up to the board:
+
+<img src="docs/images/people-counter-door-frame.jpg" alt="IR break-beam sensors mounted along the door frame" width="500">
 
 The 470 µF capacitors sit across the 5 V rail to smooth the current spikes when a servo stalls against the switch.
 
