@@ -1,0 +1,309 @@
+# =============================================================================
+#  Home Assistant automations that tie the two boards together.
+#  Exported from automations.yaml. Paste into your own automations.yaml (or
+#  recreate in the UI).
+#
+#  NOTE: `device_id` / `entity_id` values that look like random hex are
+#  install-specific registry IDs created by the HA UI. They will NOT exist on
+#  your install - re-pick those devices/entities after importing.
+#
+#  Entities used:
+#    sensor.kyles_esp32_b_room_occupancy_count   (board B)
+#    binary_sensor.kyles_esp32_b_*_beam          (board B)
+#    light.kyles_esp32_a_ceiling_lights          (board A)
+#    light.kyles_esp32_a_desk_lights             (board A)
+#    light.bedroom_lights                        (light group of the two above)
+#    input_boolean.lights_off                    helper: "room was dark when I left"
+#    input_boolean.desk_lights_only              helper: "only desk lights were on"
+#    input_boolean.idle_play_music_hpm_bed       helper: resume speaker on return
+#    input_boolean.airplay_idle_play             helper: resume AirPlay on return
+#    input_boolean.daily_mix_shuffle_mode        helper: reshuffle a playlist on return
+# =============================================================================
+
+- id: '1771422052146'
+  alias: Exit room
+  description: ''
+  triggers:
+  - entity_id:
+    - sensor.kyles_esp32_b_room_occupancy_count
+    below: 1
+    trigger: numeric_state
+  conditions:
+  - condition: device
+    device_id: 993ee2d8094493f746ba6f9483f62f1b
+    domain: vacuum
+    entity_id: 08f0de4961182e03487ce6d679f24df9
+    type: is_docked
+  actions:
+  - choose:
+    - conditions:
+      - condition: state
+        entity_id: light.kyles_esp32_a_ceiling_lights
+        state:
+        - 'on'
+      - condition: state
+        entity_id: light.kyles_esp32_a_desk_lights
+        state:
+        - 'on'
+      sequence:
+      - action: light.turn_off
+        data: {}
+        target:
+          entity_id: light.bedroom_lights
+    - conditions:
+      - condition: state
+        entity_id: light.kyles_esp32_a_ceiling_lights
+        state:
+        - 'off'
+      - condition: state
+        entity_id: light.kyles_esp32_a_desk_lights
+        state:
+        - 'on'
+      sequence:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.desk_lights_only
+        data: {}
+      - action: light.turn_off
+        data: {}
+        target:
+          entity_id: light.kyles_esp32_a_desk_lights
+    - conditions:
+      - condition: state
+        entity_id: light.kyles_esp32_a_ceiling_lights
+        state:
+        - 'on'
+      - condition: state
+        entity_id: light.kyles_esp32_a_desk_lights
+        state:
+        - 'off'
+      sequence:
+      - action: light.turn_off
+        data: {}
+        target:
+          entity_id: light.kyles_esp32_a_ceiling_lights
+    - conditions:
+      - condition: state
+        entity_id: light.bedroom_lights
+        state:
+        - 'off'
+      sequence:
+      - action: input_boolean.turn_on
+        metadata: {}
+        target:
+          entity_id: input_boolean.lights_off
+        data: {}
+  - if:
+    - condition: device
+      device_id: f7903ec6a9e88dc6b0d428d8912d2b8c
+      domain: media_player
+      entity_id: 10529e1336d49f6b5806428b6c95b721
+      type: is_playing
+    then:
+    - action: media_player.media_pause
+      data: {}
+      target:
+        device_id: f7903ec6a9e88dc6b0d428d8912d2b8c
+    - action: input_boolean.turn_on
+      data: {}
+      target:
+        entity_id: input_boolean.airplay_idle_play
+    - action: input_boolean.turn_off
+      data: {}
+      target:
+        entity_id: input_boolean.idle_play_music_hpm_bed
+    else:
+    - action: input_boolean.turn_off
+      data: {}
+      target:
+        entity_id: input_boolean.airplay_idle_play
+    - if:
+      - condition: device
+        device_id: 0453328adfda5144e3f39d9f66099df2
+        domain: media_player
+        entity_id: ff198f6f67228e6f80bb5d7eae3153e1
+        type: is_playing
+      then:
+      - action: media_player.media_pause
+        data: {}
+        target:
+          entity_id: media_player.kyles_hpm_bed
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.idle_play_music_hpm_bed
+      else:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.idle_play_music_hpm_bed
+  mode: single
+- id: '1771422826101'
+  alias: Enter Room
+  description: ''
+  triggers:
+  - type: value
+    device_id: 1023ea1418a9121fa0f9737c102be7b3
+    entity_id: f73e4c99200f2b9a4b153f3f02198183
+    domain: sensor
+    metadata:
+      secondary: false
+    trigger: device
+    above: 0
+  conditions: []
+  actions:
+  - choose:
+    - conditions:
+      - condition: state
+        entity_id: input_boolean.desk_lights_only
+        state:
+        - 'on'
+      sequence:
+      - action: light.turn_on
+        metadata: {}
+        target:
+          entity_id: light.kyles_esp32_a_desk_lights
+        data: {}
+      - action: input_boolean.turn_off
+        metadata: {}
+        target:
+          entity_id: input_boolean.desk_lights_only
+        data: {}
+    - conditions:
+      - condition: state
+        entity_id: input_boolean.lights_off
+        state:
+        - 'on'
+      sequence:
+      - action: input_boolean.turn_off
+        metadata: {}
+        target:
+          entity_id: input_boolean.lights_off
+        data: {}
+    default:
+    - action: light.turn_on
+      metadata: {}
+      target:
+        entity_id: light.bedroom_lights
+      data: {}
+  - if:
+    - condition: or
+      conditions:
+      - condition: device
+        device_id: f46f6d3584f50e77a508b96798678fa9
+        domain: media_player
+        entity_id: 7a665befbe933ab97f869daa55fa5543
+        type: is_playing
+      - condition: device
+        device_id: ff3d85fcb7a9299f681bafcd3a510484
+        domain: media_player
+        entity_id: 0e79d67951cf08c2faa79d7140b66d8a
+        type: is_playing
+    then:
+    - action: media_player.media_pause
+      metadata: {}
+      data: {}
+      target:
+        entity_id: media_player.kyles_hpm_bathroom
+    - action: media_player.media_pause
+      metadata: {}
+      target:
+        device_id: ff3d85fcb7a9299f681bafcd3a510484
+      data: {}
+  - if:
+    - condition: state
+      entity_id: input_boolean.daily_mix_shuffle_mode
+      state:
+      - 'on'
+    then:
+    - action: media_player.play_media
+      metadata: {}
+      data:
+        media_content_id: >-
+          library://playlist/{{ [281, 280, 279, 278] | random }}
+        media_content_type: music
+      target:
+        entity_id: media_player.kyles_hpm_bed
+    - action: input_boolean.turn_off
+      metadata: {}
+      target:
+        entity_id: input_boolean.idle_play_music_hpm_bed
+      data: {}
+    else:
+    - if:
+      - condition: state
+        entity_id: input_boolean.idle_play_music_hpm_bed
+        state:
+        - 'on'
+      then:
+      - action: media_player.media_play
+        metadata: {}
+        target:
+          entity_id: media_player.kyles_hpm_bed
+        data: {}
+      - action: input_boolean.turn_off
+        metadata: {}
+        target:
+          entity_id: input_boolean.idle_play_music_hpm_bed
+        data: {}
+      else:
+      - if:
+        - condition: state
+          entity_id: input_boolean.airplay_idle_play
+          state:
+          - 'on'
+        then:
+        - action: media_player.media_play
+          metadata: {}
+          data: {}
+          target:
+            device_id: f7903ec6a9e88dc6b0d428d8912d2b8c
+        - action: input_boolean.turn_off
+          metadata: {}
+          data: {}
+          target:
+            entity_id: input_boolean.airplay_idle_play
+  mode: single
+- id: '1772530537208'
+  alias: Beam Issue
+  description: ''
+  triggers:
+  - trigger: state
+    entity_id:
+    - binary_sensor.kyles_esp32_b_inner_beam
+    - binary_sensor.kyles_esp32_b_middle_beam
+    - binary_sensor.kyles_esp32_b_outer_beam
+    to:
+    - 'off'
+    for:
+      hours: 0
+      minutes: 0
+      seconds: 10
+  conditions: []
+  actions:
+  - device_id: 082ea93d2d527a2afb8302af62fe3430
+    domain: mobile_app
+    type: notify
+    message: BEAM ISSUE
+    title: HA Automations
+  mode: single
+
+- id: '1788690579345'
+  alias: Air Quality TVOC Warning
+  description: TVOC near the Bambu P2S crossed into ventilate-recommended territory
+    (UBA level 4, 600ppb+) for 5 min straight.
+  triggers:
+  - trigger: numeric_state
+    entity_id: sensor.kyles_esp32_airquality_tvoc
+    above: 600
+    for:
+      hours: 0
+      minutes: 5
+      seconds: 0
+  conditions: []
+  actions:
+  - device_id: 082ea93d2d527a2afb8302af62fe3430
+    domain: mobile_app
+    type: notify
+    message: TVOC is {{ states('sensor.kyles_esp32_airquality_tvoc') }} ppb near the
+      P2S — ventilate the room.
+    title: Air Quality Warning
+  mode: single

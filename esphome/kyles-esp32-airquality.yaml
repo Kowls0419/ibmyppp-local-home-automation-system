@@ -1,0 +1,48 @@
+esphome:
+  name: kyles-esp32-airquality
+  friendly_name: kyles-esp32-airquality
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key_airquality
+
+ota:
+  - platform: esphome
+    password: !secret ota_password_airquality
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+captive_portal:
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+
+sensor:
+  - platform: sgp30
+    address: 0x58
+    update_interval: 1s
+    eco2:
+      name: "eCO2"
+      filters:
+        - throttle: 15s
+    tvoc:
+      name: "TVOC"
+      filters:
+        - throttle: 15s
+    store_baseline: true
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+  - platform: uptime
+    name: "Uptime"

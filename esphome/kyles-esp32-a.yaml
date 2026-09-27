@@ -1,6 +1,45 @@
+# =============================================================================
+#  kyles-esp32-a  —  Light Switch Actuator
+#
+#  ESP32 DevKit V1 + two MG90S servos that physically press a two-gang wall
+#  switch (top = ceiling lights, bottom = desk lights). Exposes both as
+#  `light` entities in Home Assistant, so they work from the HA app, Apple
+#  Home / Siri (via the HomeKit Bridge), and automations.
+#
+#  Changes since the Personal Project version (March 2026):
+#    1. restore: false + explicit boot-to-neutral   -> fixes a stuck-servo bug
+#    2. boot_guard                                  -> no phantom switch press on reboot
+#    3. one shared queued script for BOTH servos    -> halves peak stall current
+#    4. max_runs cap                                -> no runaway queue backlog
+#    5. status LED on GPIO2                         -> lights on ROOM ENTRY
+#                                                      (mirrored from board B's
+#                                                      "Entry Pulse"), not on
+#                                                      servo actions
+#
+#  Secrets (API key, OTA password, fallback AP password, Wi-Fi) live in
+#  secrets.yaml — see secrets.example.yaml.
+# =============================================================================
+
 esphome:
   name: kyles-esp32-a
   friendly_name: kyles-esp32-a
+  on_boot:
+    # priority -100 = run last, after servos/outputs exist.
+    - priority: -100
+      then:
+        # FIX 1: force a known-good neutral position on every boot.
+        # 0.0 is centre and does NOT press either switch, so this is safe.
+        - lambda: |-
+            id(servo_top).write(0.0f);
+            id(servo_bottom).write(0.0f);
+        - logger.log: "Boot: servos forced to neutral"
+        # FIX 2: hold off light->servo automations until HA has settled,
+        # otherwise a restored light state slams the wall switch at boot.
+        - delay: 5s
+        - globals.set:
+            id: boot_guard
+            value: 'false'
+        - logger.log: "Boot guard released - servo presses enabled"
 
 esp32:
   board: esp32dev
@@ -8,6 +47,7 @@ esp32:
     type: arduino
 
 logger:
+
 api:
   encryption:
     key: !secret api_key_a
@@ -25,6 +65,27 @@ wifi:
 
 captive_portal:
 
+# -----------------------------------------------------------------------------
+# Room entry indicator
+#   Mirrors board B's "Entry Pulse" binary_sensor (kyles-esp32-b) - lights this
+#   board's LED on room ENTRY. Exits stay indicated on board B's own LED;
+#   this board's LED no longer lights for its own motor/servo actions.
+#   The entity_id below is what this HA install registered (the device sits in
+#   an area, hence the "kyle_s_bedroom_" prefix) - match it to yours.
+# -----------------------------------------------------------------------------
+binary_sensor:
+  - platform: homeassistant
+    id: room_entry_import
+    entity_id: binary_sensor.kyle_s_bedroom_kyles_esp32_b_entry_pulse
+    on_state:
+      then:
+        - lambda: |-
+            if (x) id(led_out).turn_on();
+            else   id(led_out).turn_off();
+
+# -----------------------------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------------------------
 output:
   - platform: ledc
     pin: GPIO18
@@ -35,6 +96,13 @@ output:
     id: pwm_bottom
     frequency: 50Hz
 
+  # FIX 5: onboard blue LED (DevKit V1 = GPIO2, active HIGH).
+  - platform: gpio
+    pin: GPIO2
+    id: led_out
+
+  # Dummy outputs exist only so the binary lights have something to bind to.
+  # All real work happens in the lights' on_turn_on / on_turn_off.
   - platform: template
     id: dummy_out_top
     type: binary
@@ -46,21 +114,37 @@ output:
     write_action:
       - lambda: |-
 
+# -----------------------------------------------------------------------------
+# Servos
+# -----------------------------------------------------------------------------
 servo:
   - id: servo_top
     output: pwm_top
     auto_detach_time: 2.5s
-    restore: true
+    # FIX 1 — THE STUCK-SERVO BUG.
+    # restore: true saved the level to flash on EVERY write. A brownout during
+    # the 850 ms press window (servo stalling against the wall switch is exactly
+    # the current spike that causes one) left the PRESS position as the last
+    # saved value. On reboot the servo drove there and auto_detach released it,
+    # leaving the arm mechanically jammed against the switch - held down
+    # continuously.
+    restore: false
   - id: servo_bottom
     output: pwm_bottom
     auto_detach_time: 2.5s
-    restore: true
+    restore: false
 
 globals:
   - id: press_dist
     type: float
     initial_value: '0.27'
     restore_value: yes
+
+  # FIX 2 - suppresses servo motion until the boot sequence has finished.
+  - id: boot_guard
+    type: bool
+    initial_value: 'true'
+    restore_value: no
 
 number:
   - platform: template
@@ -78,69 +162,125 @@ number:
       then:
         - globals.set: {id: press_dist, value: !lambda "return x;"}
 
+# -----------------------------------------------------------------------------
+# Press sequence
+# -----------------------------------------------------------------------------
 script:
-  - id: top_servo_sequence
+  # FIX 3 - ONE script for BOTH servos, so only one ever moves at a time.
+  # Previously top_servo_sequence and bottom_servo_sequence were independent
+  # queued scripts, so both servos could stall simultaneously and draw double
+  # the current. That is the main brownout trigger behind FIX 1.
+  #
+  # FIX 4 - max_runs caps the backlog. Without it, rapid HA toggling queues
+  # unbounded runs and the servos keep clacking long after you stop.
+  - id: press_switch
     mode: queued
+    max_runs: 6
     parameters:
-      target_level: float
+      which: int        # 0 = top / ceiling, 1 = bottom / desk
+      level: float
+      hold_ms: int
+      settle_ms: int
     then:
-      - servo.write: 
-          id: servo_top
-          level: !lambda "return target_level;"
-      - delay: 850ms
-      - servo.write: 
-          id: servo_top
-          level: 0.0
-      - delay: 1000ms
+      - lambda: |-
+          if (which == 0) id(servo_top).write(level);
+          else            id(servo_bottom).write(level);
+      - delay: !lambda "return hold_ms;"
+      - lambda: |-
+          if (which == 0) id(servo_top).write(0.0f);
+          else            id(servo_bottom).write(0.0f);
+      - delay: !lambda "return settle_ms;"
 
-  - id: bottom_servo_sequence
-    mode: queued
-    parameters:
-      target_level: float
-    then:
-      - servo.write: 
-          id: servo_bottom
-          level: !lambda "return target_level;"
-      - delay: 700ms
-      - servo.write: 
-          id: servo_bottom
-          level: 0.0
-      - delay: 800ms
-
+# -----------------------------------------------------------------------------
+# Lights  (entity names preserved - HA automations depend on them)
+#   light.kyles_esp32_a_ceiling_lights
+#   light.kyles_esp32_a_desk_lights
+# -----------------------------------------------------------------------------
 light:
   - platform: binary
     name: "Ceiling Lights"
     id: light_top
     output: dummy_out_top
+    restore_mode: RESTORE_DEFAULT_OFF
     on_turn_on:
-      - script.execute: 
-          id: top_servo_sequence
-          target_level: !lambda "return -1.0 * id(press_dist);"
+      - if:
+          condition:
+            lambda: 'return !id(boot_guard);'
+          then:
+            - script.execute:
+                id: press_switch
+                which: 0
+                level: !lambda "return -1.0 * id(press_dist);"
+                hold_ms: 850
+                settle_ms: 400
     on_turn_off:
-      - script.execute: 
-          id: top_servo_sequence
-          target_level: !lambda "return id(press_dist);"
+      - if:
+          condition:
+            lambda: 'return !id(boot_guard);'
+          then:
+            - script.execute:
+                id: press_switch
+                which: 0
+                level: !lambda "return id(press_dist);"
+                hold_ms: 850
+                settle_ms: 400
 
   - platform: binary
     name: "Desk Lights"
     id: light_bottom
     output: dummy_out_bottom
+    restore_mode: RESTORE_DEFAULT_OFF
     on_turn_on:
-      - script.execute: 
-          id: bottom_servo_sequence
-          target_level: !lambda "return id(press_dist);"
+      - if:
+          condition:
+            lambda: 'return !id(boot_guard);'
+          then:
+            - script.execute:
+                id: press_switch
+                which: 1
+                level: !lambda "return id(press_dist);"
+                hold_ms: 700
+                settle_ms: 400
     on_turn_off:
-      - script.execute: 
-          id: bottom_servo_sequence
-          target_level: !lambda "return -1.0 * id(press_dist);"
+      - if:
+          condition:
+            lambda: 'return !id(boot_guard);'
+          then:
+            - script.execute:
+                id: press_switch
+                which: 1
+                level: !lambda "return -1.0 * id(press_dist);"
+                hold_ms: 700
+                settle_ms: 400
 
+# -----------------------------------------------------------------------------
+# Manual controls
+# -----------------------------------------------------------------------------
 button:
   - platform: template
     name: "STOP & EMERGENCY RESET"
     icon: "mdi:alert-octagon"
     on_press:
-      - script.stop: top_servo_sequence
-      - script.stop: bottom_servo_sequence
-      - servo.write: { id: servo_top, level: 0.0 }
-      - servo.write: { id: servo_bottom, level: 0.0 }
-      - logger.log: "EMERGENCY RESET: All sequences cleared"
+      - script.stop: press_switch
+      - lambda: |-
+          id(servo_top).write(0.0f);
+          id(servo_bottom).write(0.0f);
+          id(led_out).turn_off();
+      - logger.log: "EMERGENCY RESET: queue cleared, servos neutral"
+
+# =============================================================================
+#  REMAINING RISK THAT YAML CANNOT FIX
+#
+#  The lights are `platform: binary` on dummy outputs, so HA's idea of on/off
+#  comes purely from commands issued - never from the physical switch. If one
+#  press is missed or fails, HA stays permanently inverted and every "off"
+#  turns the light on. Only a feedback sensor fixes that properly:
+#    * a reed/limit switch or photodiode on the fixture, OR
+#    * a cheap current clamp / light sensor exposed as a binary_sensor
+#  Worth considering if the inversion keeps happening after these fixes.
+#
+#  HARDWARE, if the stuck-servo bug survives FIX 1+3:
+#    * give the servos their own 5 V supply, not the ESP32's regulator
+#    * 1000 uF electrolytic across the servo power rail, close to the servos
+#  Those address the brownout at its source rather than its symptom.
+# =============================================================================

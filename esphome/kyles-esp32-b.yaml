@@ -1,6 +1,46 @@
+# =============================================================================
+#  kyles-esp32-b  —  People-Counting Sensor
+#
+#  ESP32 DevKit V1 + three IR break-beam pairs across the bedroom doorway
+#  (outer / middle / inner). Beam order decides direction: outer -> mid ->
+#  inner is an entry, inner -> mid -> outer is an exit. Publishes
+#  "Room Occupancy Count" to Home Assistant, which drives the lights.
+#
+#  Board: ESP32 DevKit V1 (DOIT) - blue LED on GPIO2, BOOT button on GPIO0.
+#
+#  WHAT CHANGED SINCE THE PERSONAL PROJECT VERSION (March 2026) AND WHY
+#  --------------------------------------------------------------------
+#  The original logic used three global flags (is_entering / is_exiting /
+#  step_reached). It was armed by whoever touched a beam FIRST, with no way to
+#  tell whose pass was in progress - so one person's abandoned half-sequence
+#  became the next person's sequence. Two failure modes seen in practice:
+#
+#   * Someone loitering by the door set is_entering=true. A second person then
+#     walked OUT; their inner hit could not start an exit (the !is_entering
+#     guard failed) and was silently swallowed, their mid hit advanced
+#     step_reached to 2, and their next inner hit counted as an ENTRY.
+#     Someone left and the count went UP.
+#
+#   * system_locked blocked BOTH directions for 1.5 s after any count, so a
+#     second person entering right behind the first was never seen, and the
+#     lights turned off with someone in the room.
+#
+#  This rewrite replaces "who armed it" with "what actually happened, in order,
+#  with timestamps", and commits only on a clean pass with the doorway verified
+#  empty. Plus a hard ceiling on the count, a physical button for pause modes,
+#  and a status LED.
+# =============================================================================
+
 esphome:
   name: kyles-esp32-b
   friendly_name: kyles-esp32-b
+  on_boot:
+    # Publish the (restored) occupancy immediately. Without this the template
+    # sensor sits at 'unknown' until the first commit, and HA's "Exit room"
+    # numeric_state trigger cannot evaluate a non-numeric state.
+    - priority: -100
+      then:
+        - component.update: occupancy_sensor
 
 esp32:
   board: esp32dev
@@ -8,6 +48,7 @@ esp32:
     type: arduino
 
 logger:
+
 api:
   encryption:
     key: !secret api_key_b
@@ -22,142 +63,401 @@ wifi:
 
 captive_portal:
 
+# =============================================================================
+#  >>> BEAM POLARITY - READ THIS FIRST IF COUNTING MISBEHAVES ON YOUR BUILD <<<
+#
+#  Pins are INPUT_PULLUP with no `inverted:`, so the sensor reads ON when the
+#  pin is HIGH. With these receivers (normally open):
+#
+#        beam intact / clear  ->  pin HIGH  ->  state ON
+#        beam blocked         ->  pin LOW   ->  state OFF
+#
+#  So a person BREAKING a beam produces on_release, and clearing it produces
+#  on_press. That is why every beam below records its event on `on_release`,
+#  and why beam_clear() tests for .state == true.
+#
+#  If your receivers have the opposite output and NOTHING EVER COUNTS, swap
+#  the three `on_release:` keys to `on_press:` AND flip the `.state` checks in
+#  the "Doorway Clear" sensor and the commit interval. Those are the only
+#  places polarity is encoded. The "Doorway Clear" diagnostic sensor lets you
+#  confirm it in seconds by walking through the door.
+# =============================================================================
+
 globals:
+  # ---- occupancy -----------------------------------------------------------
   - id: room_occupancy
     type: int
     initial_value: '0'
-    restore_value: yes
-  - id: system_locked
-    type: bool
-    initial_value: 'false'
-  - id: is_entering
-    type: bool
-    initial_value: 'false'
-  - id: is_exiting
-    type: bool
-    initial_value: 'false'
-  - id: step_reached
+    restore_value: yes        # deliberately KEPT: a reboot resetting to 0 would
+                              # fire HA's "Exit room" and kill the lights on you
+
+  # ---- event sequence ------------------------------------------------------
+  - id: seq_beams             # ordered beam ids: 0=outer, 1=mid, 2=inner
+    type: int[8]
+    restore_value: no
+    # initial_value omitted deliberately: for ARRAY globals the '{}' form
+    # resolves to GlobalsComponent(T) which decays to a pointer and fails to
+    # compile. The default ctor zero-inits via `T value_{}` - same intent.
+  - id: seq_times             # millis() timestamp per event
+    type: uint32_t[8]
+    restore_value: no
+    # initial_value omitted deliberately: for ARRAY globals the '{}' form
+    # resolves to GlobalsComponent(T) which decays to a pointer and fails to
+    # compile. The default ctor zero-inits via `T value_{}` - same intent.
+  - id: seq_len
     type: int
-    initial_value: '0' 
-    # 0: Idle, 1: First Sensor Hit, 2: Mid Sensor Hit
+    initial_value: '0'
+    restore_value: no
 
-script:
-  - id: reset_logic
-    then:
-      - globals.set: {id: is_entering, value: 'false'}
-      - globals.set: {id: is_exiting, value: 'false'}
-      - globals.set: {id: step_reached, value: '0'}
+  # ---- pending commit ------------------------------------------------------
+  # An int delta, not a single direction, so two people passing before the
+  # doorway clears both get counted instead of one being dropped.
+  - id: pending_delta
+    type: int
+    initial_value: '0'
+    restore_value: no
+  - id: pending_since
+    type: uint32_t
+    initial_value: '0'
+    restore_value: no
 
-  - id: sequence_timeout
-    mode: restart
-    then:
-      - delay: 3s
-      - script.execute: reset_logic
-      - logger.log: "Sequence timed out - Resetting to Idle"
+  # ---- ui ------------------------------------------------------------------
+  - id: pause_mode            # 0 = Normal, 1 = Skip Next Exit, 2 = Hold Lights On
+    type: int
+    initial_value: '0'
+    restore_value: yes
+  - id: led_flash_until
+    type: uint32_t
+    initial_value: '0'
+    restore_value: no
+  - id: entry_flash_until   # drives the "Entry Pulse" binary_sensor only -
+    type: uint32_t          # entries no longer flash this board's own LED,
+    initial_value: '0'      # that's mirrored onto the motor board (A) instead
+    restore_value: no
 
+# =============================================================================
+#  Beam sensors  (names preserved - HA automations reference these)
+# =============================================================================
 binary_sensor:
-  # SENSOR 1: OUTER (Hallway side)
   - platform: gpio
     pin: {number: GPIO32, mode: INPUT_PULLUP}
     id: beam_outer
     name: "Outer Beam"
-    on_press:
-      then:
-        - if:
-            condition: {lambda: 'return !id(system_locked);'}
-            then:
-              - script.execute: sequence_timeout
-              # CASE A: Starting an entry
-              - if:
-                  condition: {lambda: 'return !id(is_entering) && !id(is_exiting);'}
-                  then:
-                    - globals.set: {id: is_entering, value: 'true'}
-                    - globals.set: {id: step_reached, value: '1'}
-                    - logger.log: "Entry Started (Outer Hit)"
-              # CASE B: Finishing an exit (Must have come from Inner -> Mid)
-              - if:
-                  condition: {lambda: 'return id(is_exiting) && id(step_reached) == 2;'}
-                  then:
-                    - lambda: 'if (id(room_occupancy) > 0) id(room_occupancy)--;'
-                    - logger.log: "EXIT CONFIRMED (Third Sensor Hit)"
-                    - globals.set: {id: system_locked, value: 'true'}
-                    - script.execute: reset_logic
-                    - component.update: occupancy_sensor
-                    - delay: 1.5s
-                    - globals.set: {id: system_locked, value: 'false'}
+    filters:
+      - delayed_on: 15ms      # debounce without blunting a real pass
+      - delayed_off: 15ms
+    on_release:               # <- beam BROKEN (see polarity block above)
+      - script.execute: {id: beam_blocked, b: 0}
 
-  # SENSOR 2: MIDDLE
   - platform: gpio
     pin: {number: GPIO33, mode: INPUT_PULLUP}
     id: beam_mid
     name: "Middle Beam"
-    on_press:
-      then:
-        - if:
-            condition: {lambda: 'return id(step_reached) == 1;'}
-            then: 
-              - script.execute: sequence_timeout
-              - globals.set: {id: step_reached, value: '2'}
-              - logger.log: "Step 2: Mid Hit (In Transit)"
+    filters:
+      - delayed_on: 15ms
+      - delayed_off: 15ms
+    on_release:
+      - script.execute: {id: beam_blocked, b: 1}
 
-  # SENSOR 3: INNER (Room side)
   - platform: gpio
     pin: {number: GPIO18, mode: INPUT_PULLUP}
     id: beam_inner
     name: "Inner Beam"
-    on_press:
-      then:
-        - if:
-            condition: {lambda: 'return !id(system_locked);'}
-            then:
-              - script.execute: sequence_timeout
-              # CASE A: Starting an exit
-              - if:
-                  condition: {lambda: 'return !id(is_entering) && !id(is_exiting);'}
-                  then:
-                    - globals.set: {id: is_exiting, value: 'true'}
-                    - globals.set: {id: step_reached, value: '1'}
-                    - logger.log: "Exit Started (Inner Hit)"
-              # CASE B: Finishing an entry (Must have come from Outer -> Mid)
-              - if:
-                  condition: {lambda: 'return id(is_entering) && id(step_reached) == 2;'}
-                  then:
-                    - lambda: 'id(room_occupancy)++;'
-                    - logger.log: "ENTRY CONFIRMED (Third Sensor Hit)"
-                    - globals.set: {id: system_locked, value: 'true'}
-                    - script.execute: reset_logic
-                    - component.update: occupancy_sensor
-                    - delay: 1.5s
-                    - globals.set: {id: system_locked, value: 'false'}
+    filters:
+      - delayed_on: 15ms
+      - delayed_off: 15ms
+    on_release:
+      - script.execute: {id: beam_blocked, b: 2}
 
+  # Diagnostic - flash this, watch it in HA, and you can confirm the polarity
+  # assumption above in about ten seconds by walking through the door.
+  - platform: template
+    name: "Doorway Clear"
+    id: doorway_clear
+    lambda: |-
+      return id(beam_outer).state && id(beam_mid).state && id(beam_inner).state;
+
+  # Mirrored onto the motor board's (A) LED via ESPHome's homeassistant:
+  # import - board A lights up on entry, this board's own LED stays exit-only.
+  - platform: template
+    name: "Entry Pulse"
+    id: entry_pulse
+    lambda: |-
+      return millis() < id(entry_flash_until);
+
+  # ---- onboard BOOT button (GPIO0) ----------------------------------------
+  # EN is hardwired to reset and unusable, so GPIO0 is the ONLY user button.
+  # All three requested functions are multiplexed onto it by press pattern.
+  #   single click  -> toggle "Skip Next Exit"   (one-off, e.g. quick trip out)
+  #   double click  -> toggle "Hold Lights On"   (indefinite)
+  #   long press    -> reset occupancy to 0
+  # NOTE: GPIO0 is a strapping pin. Pressing it at runtime is fine; just don't
+  # hold it while the board resets or it enters flash-download mode.
+  - platform: gpio
+    pin: {number: GPIO0, mode: INPUT_PULLUP, inverted: true}
+    id: boot_button
+    name: "Board Button"
+    internal: true
+    filters:
+      - delayed_on: 25ms
+      - delayed_off: 25ms
+    on_multi_click:
+      # long press first - most specific pattern wins
+      - timing:
+          - ON for at least 1.5s
+        then:
+          - lambda: |-
+              id(room_occupancy) = 0;
+              id(seq_len) = 0;
+              id(pending_delta) = 0;
+              id(led_flash_until) = millis() + 1500;
+          - component.update: occupancy_sensor
+          - logger.log: "BUTTON: occupancy reset to 0"
+      # double click -> indefinite hold
+      - timing:
+          - ON for at most 0.6s
+          - OFF for at most 0.4s
+          - ON for at most 0.6s
+          - OFF for at least 0.3s
+        then:
+          - lambda: |-
+              id(pause_mode) = (id(pause_mode) == 2) ? 0 : 2;
+              id(led_flash_until) = millis() + 800;
+          - script.execute: sync_mode_select
+          - logger.log: "BUTTON: toggled Hold Lights On"
+      # single click -> skip the next auto-off only
+      - timing:
+          - ON for at most 0.6s
+          - OFF for at least 0.6s
+        then:
+          - lambda: |-
+              id(pause_mode) = (id(pause_mode) == 1) ? 0 : 1;
+              id(led_flash_until) = millis() + 800;
+          - script.execute: sync_mode_select
+          - logger.log: "BUTTON: toggled Skip Next Exit"
+
+# =============================================================================
+#  Core counting logic
+# =============================================================================
+script:
+  - id: beam_blocked
+    mode: parallel
+    parameters:
+      b: int
+    then:
+      - lambda: |-
+          const uint32_t MAX_AGE = 6000;   // an event older than this is not
+                                           // part of the current pass
+          uint32_t now = millis();
+
+          // ---- 1. age out stale events individually -----------------------
+          // Replaces the old blanket 3 s sequence_timeout, which punished a
+          // slow walk. Now a 5-second stroll still counts, but a 20-second-old
+          // outer hit will never pair with a fresh mid hit.
+          int w = 0;
+          for (int i = 0; i < id(seq_len); i++) {
+            if (now - id(seq_times)[i] <= MAX_AGE) {
+              id(seq_beams)[w] = id(seq_beams)[i];
+              id(seq_times)[w] = id(seq_times)[i];
+              w++;
+            }
+          }
+          id(seq_len) = w;
+
+          // ---- 2. ignore re-trigger of the same beam ----------------------
+          // This is the loiterer guard: someone shuffling in the outer beam
+          // just refreshes the timestamp, it never advances the sequence.
+          if (id(seq_len) > 0 && id(seq_beams)[id(seq_len) - 1] == b) {
+            id(seq_times)[id(seq_len) - 1] = now;
+            return;
+          }
+
+          // ---- 3. abort on any anomaly ------------------------------------
+          // Old code committed half-sequences. This throws the whole run away
+          // and restarts from the current event instead.
+          if (id(seq_len) > 0) {
+            int prev = id(seq_beams)[id(seq_len) - 1];
+            if (abs(b - prev) != 1) {
+              id(seq_len) = 0;                 // skipped a beam entirely
+            } else if (id(seq_len) >= 2) {
+              int prev2 = id(seq_beams)[id(seq_len) - 2];
+              if ((prev - prev2) != (b - prev)) {
+                id(seq_len) = 0;               // turned back mid-doorway
+              }
+            }
+          }
+
+          // ---- 4. append --------------------------------------------------
+          if (id(seq_len) >= 8) id(seq_len) = 0;
+          id(seq_beams)[id(seq_len)] = b;
+          id(seq_times)[id(seq_len)] = now;
+          id(seq_len)++;
+
+          // ---- 5. complete pass? ------------------------------------------
+          if (id(seq_len) == 3) {
+            int d = id(seq_beams)[2] - id(seq_beams)[0];
+            if (d == 2) {                      // outer -> mid -> inner
+              id(pending_delta) += 1;
+              ESP_LOGI("count", "ENTRY staged (awaiting clear doorway)");
+            } else if (d == -2) {              // inner -> mid -> outer
+              id(pending_delta) -= 1;
+              ESP_LOGI("count", "EXIT staged (awaiting clear doorway)");
+            }
+            if (id(pending_since) == 0) id(pending_since) = now;
+            id(seq_len) = 0;                   // free the machine for the next
+                                               // person immediately
+          }
+
+  # Keeps the HA dropdown in step when the mode is changed from the button.
+  - id: sync_mode_select
+    mode: restart
+    then:
+      - lambda: |-
+          auto opts = std::vector<std::string>{"Normal", "Skip Next Exit", "Hold Lights On"};
+          auto call = id(pause_select).make_call();
+          call.set_option(opts[id(pause_mode)]);
+          call.perform();
+
+# =============================================================================
+#  Commit + LED driver
+# =============================================================================
+interval:
+  - interval: 250ms
+    then:
+      - lambda: |-
+          const int MAX_OCCUPANCY = 5;         // hard ceiling - stops runaway counts
+          const uint32_t PENDING_FAILSAFE = 30000;
+          uint32_t now = millis();
+
+          // drop a stalled partial sequence
+          if (id(seq_len) > 0 && now - id(seq_times)[id(seq_len) - 1] > 8000) {
+            id(seq_len) = 0;
+          }
+
+          if (id(pending_delta) == 0) { id(pending_since) = 0; return; }
+
+          bool clear = id(beam_outer).state && id(beam_mid).state && id(beam_inner).state;
+
+          // THE KEY GATE: nothing commits while anyone is still standing in the
+          // doorway. A loiterer holds at least one beam blocked, so their
+          // movement can never produce a count - it just sits here uncommitted.
+          //
+          // Failsafe: if a beam is genuinely obstructed (box in the doorway),
+          // commit anyway after 30 s rather than silently losing the count.
+          bool timed_out = (id(pending_since) != 0) &&
+                           (now - id(pending_since) > PENDING_FAILSAFE);
+          if (!clear && !timed_out) return;
+
+          int before = id(room_occupancy);
+          int after = before + id(pending_delta);
+          if (after < 0) after = 0;
+          if (after > MAX_OCCUPANCY) after = MAX_OCCUPANCY;
+          id(room_occupancy) = after;
+          bool was_entry = id(pending_delta) > 0;
+
+          ESP_LOGI("count", "COMMIT %+d : %d -> %d%s",
+                   id(pending_delta), before, after, timed_out ? " (failsafe)" : "");
+
+          id(pending_delta) = 0;
+          id(pending_since) = 0;
+          id(seq_len) = 0;
+          id(occupancy_sensor).update();
+          // entries pulse "Entry Pulse" (mirrored onto board A's LED);
+          // exits still flash this board's own LED, as before.
+          if (was_entry) id(entry_flash_until) = now + 600;
+          else            id(led_flash_until) = now + 600;
+
+  # ---- status LED (DevKit V1 blue, GPIO2, active HIGH) ---------------------
+  #   fast flash  = something just changed (count committed / mode toggled)
+  #   solid on    = "Hold Lights On"   (indefinite pause)
+  #   slow blink  = "Skip Next Exit"   (one-off pause armed)
+  #   off         = normal operation
+  - interval: 100ms
+    then:
+      - lambda: |-
+          uint32_t now = millis();
+          bool on;
+          if (now < id(led_flash_until))      on = ((now / 100) % 2 == 0);
+          else if (id(pause_mode) == 2)       on = true;
+          else if (id(pause_mode) == 1)       on = ((now / 1000) % 2 == 0);
+          else                                on = false;
+          if (on) id(led_out).turn_on(); else id(led_out).turn_off();
+
+output:
+  - platform: gpio
+    pin: GPIO2
+    id: led_out
+
+# =============================================================================
+#  Entities exposed to Home Assistant
+#  (names preserved exactly - existing automations depend on them)
+# =============================================================================
 sensor:
   - platform: template
     name: "Room Occupancy Count"
     id: occupancy_sensor
     lambda: 'return (float)id(room_occupancy);'
-    update_interval: never
+    # 60s republish is a self-heal safety net; commits still call .update()
+    # immediately, so responsiveness is unchanged. HA writes no new state row
+    # when the value is unchanged, so this costs nothing in the recorder.
+    update_interval: 60s
     unit_of_measurement: "ppl"
     accuracy_decimals: 0
+
+select:
+  - platform: template
+    name: "Light Auto-Off Mode"
+    id: pause_select
+    icon: "mdi:lightbulb-auto"
+    optimistic: true
+    options:
+      - "Normal"
+      - "Skip Next Exit"
+      - "Hold Lights On"
+    initial_option: "Normal"
+    restore_value: true
+    on_value:
+      - lambda: |-
+          if      (x == "Skip Next Exit")  id(pause_mode) = 1;
+          else if (x == "Hold Lights On")  id(pause_mode) = 2;
+          else                             id(pause_mode) = 0;
 
 button:
   - platform: template
     name: "Add Person Manually"
     icon: "mdi:plus"
     on_press:
-      - lambda: 'id(room_occupancy)++;'
+      - lambda: |-
+          if (id(room_occupancy) < 5) id(room_occupancy)++;
       - component.update: occupancy_sensor
 
   - platform: template
     name: "Subtract Person Manually"
     icon: "mdi:minus"
     on_press:
-      - lambda: 'if (id(room_occupancy) > 0) id(room_occupancy)--;'
+      - lambda: |-
+          if (id(room_occupancy) > 0) id(room_occupancy)--;
       - component.update: occupancy_sensor
 
   - platform: template
     name: "Reset Occupancy"
     icon: "mdi:refresh"
     on_press:
-      - globals.set: {id: room_occupancy, value: '0'}
-      - script.execute: reset_logic
+      - lambda: |-
+          id(room_occupancy) = 0;
+          id(seq_len) = 0;
+          id(pending_delta) = 0;
+          id(pending_since) = 0;
       - component.update: occupancy_sensor
+
+# =============================================================================
+#  HOME ASSISTANT SIDE
+#
+#  * "Exit room" triggers on Room Occupancy Count dropping below 1, and
+#    "Enter Room" on it rising above 0 - see home-assistant/automations.yaml.
+#  * "Beam Issue" alerts if any beam reads 'off' (blocked) for 10 s, i.e. a
+#    sensor got knocked out of alignment.
+#  * TODO: the "Light Auto-Off Mode" select is exposed, but "Exit room" does
+#    not consult it yet. Wiring it in means a condition on
+#    `state == "Normal"` plus a branch that consumes "Skip Next Exit" once.
+# =============================================================================
